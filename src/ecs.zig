@@ -19,19 +19,15 @@ pub const EcsAllocator = struct {
         frame_percent: f32,
         frame_used_mb: usize,
     };
-    // ---------------------------------------
-    frame_sector: []u8, // frame arena
-    world_arena: std.heap.ArenaAllocator,
+    frame_sector: []u8,
     frame_alloc: std.heap.FixedBufferAllocator,
     frame_max_alloc_perc: f32 = 0,
     parent: std.mem.Allocator,
 
-    /// requires pinned postion on memory.
     pub fn init(allocator: std.mem.Allocator, frame_mem: usize) !EcsAllocator {
         const frame_sector = try allocator.alloc(u8, frame_mem);
         return .{
             .frame_sector = frame_sector,
-            .world_arena = std.heap.ArenaAllocator.init(allocator),
             .frame_alloc = std.heap.FixedBufferAllocator.init(frame_sector),
             .parent = allocator,
         };
@@ -39,66 +35,30 @@ pub const EcsAllocator = struct {
 
     pub fn refreshVTable(self: *Self, gpa: std.mem.Allocator) void {
         self.parent = gpa;
-        self.world_arena.child_allocator = gpa;
     }
 
     pub fn deinit(self: *Self) void {
         self.parent.free(self.frame_sector);
-        self.world_arena.deinit();
         self.frame_alloc.reset();
     }
 
-    /// general purpose world allocator. Lifetime = App
-    /// # TODO: add beter mem tracing
     pub fn world(self: *Self) std.mem.Allocator {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .alloc = alloc,
-                .resize = resize,
-                .remap = remap,
-                .free = free,
-            },
-        };
+        return self.parent;
     }
 
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.world_arena.allocator().rawAlloc(len, alignment, ra);
-    }
-
-    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.world_arena.allocator().rawResize(buf, alignment, new_len, ret_addr);
-    }
-
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.world_arena.allocator().rawRemap(memory, alignment, new_len, ret_addr);
-    }
-
-    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *Self = @ptrCast(@alignCast(ctx));
-        return self.world_arena.allocator().rawFree(buf, alignment, ret_addr);
-    }
-
-    /// General purpose frame allocator. Lifetime = single frame
-    /// Backed by a buffer allocator. No free, resize or remap!
     pub fn frame(self: *Self) std.mem.Allocator {
         return self.frame_alloc.threadSafeAllocator();
     }
 
-    /// reset the frame arena
     pub fn resetFrame(self: *Self) void {
         const frame_percent: f32 = @floatCast(@as(f64, @floatFromInt(self.frame_alloc.end_index)) / @as(f64, @floatFromInt(self.frame_sector.len)));
         self.frame_max_alloc_perc = frame_percent;
         self.frame_alloc.reset();
     }
 
-    /// # TODO: world_mem is very unpresice
     pub fn stats(self: *Self) Stats {
         return Stats{
-            .world_mem = self.world_arena.queryCapacity(),
+            .world_mem = 0,
             .frame_percent = @floatCast(@as(f64, @floatFromInt(self.frame_alloc.end_index)) / @as(f64, @floatFromInt(self.frame_sector.len))),
             .frame_used_mb = @divTrunc(self.frame_alloc.end_index, @import("root.zig").MB),
         };
@@ -217,10 +177,15 @@ pub fn App(comptime desc: AppDesc) type {
             return self.components.entity_lookup.contains(ent);
         }
 
-        /// end?
         pub fn deinit(self: *World) void {
+            const gpa = self.memtator.world();
+            self.entities.unused.deinit(gpa);
+            self.components.releaseAllComponentRegistryMemory(gpa);
+            self.resources.deinit(gpa);
+            self.systems.releaseAllSystemRegistryMemory(gpa);
+            self.hooks.releaseAllHookRegistryMemory(gpa);
             self.memtator.deinit();
-            self.memtator.parent.destroy(self);
+            gpa.destroy(self);
         }
 
         /// modify the world and a thread safe way
@@ -776,10 +741,34 @@ pub fn App(comptime desc: AppDesc) type {
                 return .{};
             }
 
-            /// free all registered systems, leaky, debug only idc
             pub fn clear(self: *Self, gpa: std.mem.Allocator) void {
-                self.systems.clearAndFree(gpa);
-                self.schedule_order.clearAndFree(gpa);
+                self.releaseAllSystemRegistryMemory(gpa);
+            }
+
+            pub fn releaseAllSystemRegistryMemory(self: *Self, gpa: std.mem.Allocator) void {
+                var systemDebugIterator = self.systems.iterator();
+                while (systemDebugIterator.next()) |systemEntry| {
+                    gpa.free(systemEntry.value_ptr.debug);
+                }
+                self.systems.deinit(gpa);
+                self.systems = .empty;
+                var localRegistryIterator = self.locals.iterator();
+                while (localRegistryIterator.next()) |localRegistryEntry| {
+                    localRegistryEntry.value_ptr.deinit(gpa);
+                }
+                self.locals.deinit(gpa);
+                self.locals = .empty;
+                var scheduleIterator = self.schedule_order.iterator();
+                while (scheduleIterator.next()) |scheduleEntry| {
+                    for (scheduleEntry.value_ptr.systems.items) |*scheduledSystemEntry| {
+                        if (scheduledSystemEntry.deps) |*dependencyList| {
+                            dependencyList.deinit(gpa);
+                        }
+                    }
+                    scheduleEntry.value_ptr.systems.deinit(gpa);
+                }
+                self.schedule_order.deinit(gpa);
+                self.schedule_order = .empty;
             }
 
             pub fn getScheduleTime(self: *SystemRegistry, schedule: anytype) i128 {
@@ -889,7 +878,7 @@ pub fn App(comptime desc: AppDesc) type {
                     .ptr = @constCast(func),
                     .access = access,
                     .condition = condition_fn,
-                    .debug = try std.fmt.allocPrint(gpa, "{s}", .{fn_name}),
+                    .debug = try gpa.dupe(u8, fn_name),
                     .run = (struct {
                         fn run(ptr: *anyopaque, world: *World, locals: *LocalRegistry(desc.FlagInt), last_run_tick: u32) EcsError!void {
                             @setEvalBranchQuota(6400);
@@ -993,34 +982,34 @@ pub fn App(comptime desc: AppDesc) type {
                         }
                     },
                     .type => {
-                        // chain
                         if (@hasDecl(system, "_is_chain")) {
-                            var deps: std.ArrayList(SystemID) = .empty;
+                            var accumulatedDependencyIds: std.ArrayList(SystemID) = .empty;
+                            defer accumulatedDependencyIds.deinit(gpa);
                             inline for (system.inner) |field| {
                                 const field_ty = @TypeOf(field);
                                 switch (@typeInfo(field_ty)) {
                                     .@"struct" => |_struct| {
                                         if (!_struct.is_tuple) @compileLog("only pointers and tuples allowed in chains");
-                                        // add group with same deps
-                                        const tuple_deps = try deps.clone(gpa);
+                                        var snapshotDependencyIds = try accumulatedDependencyIds.clone(gpa);
+                                        defer snapshotDependencyIds.deinit(gpa);
                                         inline for (field) |func| {
                                             const id = try self.putSystem(gpa, app, func, condition_fn);
                                             try set.value_ptr.systems.append(gpa, .{
                                                 .id = id,
-                                                .deps = tuple_deps,
+                                                .deps = if (snapshotDependencyIds.items.len > 0) try snapshotDependencyIds.clone(gpa) else null,
                                             });
 
-                                            try deps.append(gpa, id);
+                                            try accumulatedDependencyIds.append(gpa, id);
                                         }
                                     },
                                     else => {
                                         const id = try self.putSystem(gpa, app, field, condition_fn);
                                         try set.value_ptr.systems.append(gpa, .{
                                             .id = id,
-                                            .deps = if (deps.items.len > 0) try deps.clone(gpa) else null,
+                                            .deps = if (accumulatedDependencyIds.items.len > 0) try accumulatedDependencyIds.clone(gpa) else null,
                                         });
 
-                                        try deps.append(gpa, id);
+                                        try accumulatedDependencyIds.append(gpa, id);
                                     },
                                 }
                             }
@@ -1855,6 +1844,10 @@ fn QueryState(FlagInt: type, comptime Q: type, comptime F: Filter) type {
                 }
             }
         }
+
+        pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
+            self.matched_archtypes.deinit(gpa);
+        }
     };
 }
 
@@ -2252,9 +2245,10 @@ pub fn ResourceRegistry(FlagInt: type) type {
         };
 
         pub fn deinit(self: *Self, gpa: std.mem.Allocator) void {
-            var it = self.data.iterator();
-            while (it.next()) |entry| entry.value_ptr.deinit(entry.value_ptr.ctx, gpa);
+            var resourceIterator = self.data.iterator();
+            while (resourceIterator.next()) |entry| entry.value_ptr.deinit(entry.value_ptr.ctx, gpa);
             self.data.deinit(gpa);
+            self.codecs.deinit(gpa);
         }
 
         pub fn get(self: *const Self, comptime T: type) ?*T {
@@ -2477,6 +2471,7 @@ pub fn ArchType(FlagInt: type) type {
         /// |ENTITY,ENTITY.. |XX|C1,C1..Tick,Tick..|X|C2,C2..Tick,Tick..
         bytes: []u8 = undefined,
         alignment: usize = 0,
+        allocatedTableAlignment: usize = 16,
         columns: std.ArrayList(ColMeta) = .empty,
         /// entity -> index
         entity_lookup: std.AutoHashMapUnmanaged(Entity, usize) = .empty,
@@ -2943,11 +2938,10 @@ pub fn ArchType(FlagInt: type) type {
             }
         }
 
-        /// realloc memory to new capacity
-        /// new capaicty > current or crash
         pub fn setCapacity(self: *Self, gpa: std.mem.Allocator, flags: *HeapFlagSet(FlagInt), new_capacity: usize) !void {
             assert(new_capacity >= self.len);
-            // new size
+            const desiredTableAlignmentValue = @max(self.alignment, 16);
+            const lifetimeTableBufferAlignment = std.mem.Alignment.fromByteUnits(desiredTableAlignmentValue);
             var size = std.mem.alignForward(usize, @sizeOf(Entity) * new_capacity, self.alignment);
             var offset = size;
             for (self.columns.items) |meta| {
@@ -2957,57 +2951,75 @@ pub fn ArchType(FlagInt: type) type {
             }
             size = offset;
 
-            const new_bytes = (gpa.rawAlloc(
+            const freshlyAllocatedTableBytes = (gpa.rawAlloc(
                 size,
-                std.mem.Alignment.fromByteUnits(self.alignment),
+                lifetimeTableBufferAlignment,
                 @returnAddress(),
             ) orelse return error.OutOfMemory)[0..size];
 
             if (self.capacity == 0) {
-                self.bytes = new_bytes;
+                self.bytes = freshlyAllocatedTableBytes;
                 self.capacity = new_capacity;
+                self.allocatedTableAlignment = desiredTableAlignmentValue;
                 self.calcTableOffsets(flags);
                 return;
             }
 
-            // copy entities
             const entity_size = @sizeOf(Entity) * self.len;
-            @memcpy(new_bytes[0..entity_size], self.bytes[0..entity_size]);
+            @memcpy(freshlyAllocatedTableBytes[0..entity_size], self.bytes[0..entity_size]);
 
-            // offset to comp table
             var new_offset = std.mem.alignForward(usize, @sizeOf(Entity) * new_capacity, self.alignment);
 
             for (self.columns.items) |*meta| {
-                // Align new offset
                 const typeId = flags.getId(meta.flag);
                 new_offset = std.mem.alignForward(usize, new_offset, typeId.alignment);
 
-                // Copy component data
                 const old_comp_offset = meta.offset;
                 const copy_size = meta.size * self.len;
                 @memcpy(
-                    new_bytes[new_offset .. new_offset + copy_size],
+                    freshlyAllocatedTableBytes[new_offset .. new_offset + copy_size],
                     self.bytes[old_comp_offset .. old_comp_offset + copy_size],
                 );
 
                 meta.offset = new_offset;
 
-                // Move to tick section (both old and new)
                 const old_tick_offset = old_comp_offset + meta.size * self.capacity;
                 new_offset += meta.size * new_capacity;
 
                 const tick_size = @sizeOf(TickInfo) * self.len;
                 @memcpy(
-                    new_bytes[new_offset .. new_offset + tick_size],
+                    freshlyAllocatedTableBytes[new_offset .. new_offset + tick_size],
                     self.bytes[old_tick_offset .. old_tick_offset + tick_size],
                 );
 
                 new_offset += @sizeOf(TickInfo) * new_capacity;
             }
 
-            gpa.free(self.bytes);
-            self.bytes = new_bytes;
+            gpa.rawFree(self.bytes, std.mem.Alignment.fromByteUnits(self.allocatedTableAlignment), @returnAddress());
+            self.bytes = freshlyAllocatedTableBytes;
             self.capacity = new_capacity;
+            self.allocatedTableAlignment = desiredTableAlignmentValue;
+        }
+
+        pub fn releaseAllArchTableMemory(self: *Self, gpa: std.mem.Allocator) void {
+            for (self.columns.items) |*columnMeta| {
+                if (columnMeta.hash == hashType(Children)) {
+                    var rowIndex: usize = 0;
+                    while (rowIndex < self.len) : (rowIndex += 1) {
+                        const componentOffset = columnMeta.offset + columnMeta.size * rowIndex;
+                        const childrenPtr: *Children = @ptrCast(@alignCast(self.bytes[componentOffset .. componentOffset + columnMeta.size]));
+                        childrenPtr.items.deinit(gpa);
+                    }
+                }
+            }
+            if (self.capacity > 0) {
+                gpa.rawFree(self.bytes, std.mem.Alignment.fromByteUnits(self.allocatedTableAlignment), @returnAddress());
+            }
+            self.columns.deinit(gpa);
+            self.entity_lookup.deinit(gpa);
+            self.column_lookup.deinit(gpa);
+            self.len = 0;
+            self.capacity = 0;
         }
     };
 }
@@ -3247,11 +3259,20 @@ fn ComponentRegistry(FlagInt: type) type {
             _ = try self.entity_lookup.put(allocator, entity, new_arch_id.value_ptr.*);
         }
 
-        /// TODO: deinit allocating components
         pub fn despawn(self: *Self, allocator: std.mem.Allocator, entity: Entity) !void {
             const arch_id = self.entity_lookup.get(entity) orelse return;
             try self.archtypes.items[arch_id].remove(allocator, entity);
             _ = self.entity_lookup.remove(entity);
+        }
+
+        pub fn releaseAllComponentRegistryMemory(self: *Self, gpa: std.mem.Allocator) void {
+            for (self.archtypes.items) |*archTable| {
+                archTable.releaseAllArchTableMemory(gpa);
+            }
+            self.archtypes.deinit(gpa);
+            self.entity_lookup.deinit(gpa);
+            self.archtypes_lookup.deinit(gpa);
+            self.codecs.deinit(gpa);
         }
     };
 }
@@ -3595,6 +3616,24 @@ pub fn HookRegistry(desc: AppDesc) type {
         const FlagSet = HeapFlagSet(desc.FlagInt);
         pub const HookFn = *const fn (*anyopaque, Entity, *World) EcsError!void;
         pub const Hook = struct { run: HookFn };
+
+        pub fn releaseAllHookRegistryMemory(self: *Self, gpa: std.mem.Allocator) void {
+            var addHookIterator = self.add_hooks.iterator();
+            while (addHookIterator.next()) |hookListEntry| {
+                hookListEntry.value_ptr.deinit(gpa);
+            }
+            self.add_hooks.deinit(gpa);
+            var removeHookIterator = self.remove_hooks.iterator();
+            while (removeHookIterator.next()) |hookListEntry| {
+                hookListEntry.value_ptr.deinit(gpa);
+            }
+            self.remove_hooks.deinit(gpa);
+            var despawnHookIterator = self.despawn_hooks.iterator();
+            while (despawnHookIterator.next()) |hookListEntry| {
+                hookListEntry.value_ptr.deinit(gpa);
+            }
+            self.despawn_hooks.deinit(gpa);
+        }
 
         pub fn runAddedHook(self: *Self, flag: FlagSet.Flag, comp: *anyopaque, entity: Entity, world: *World) !void {
             const hooks = self.add_hooks.get(flag) orelse return;
