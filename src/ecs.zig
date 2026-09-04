@@ -596,13 +596,12 @@ pub fn App(comptime desc: AppDesc) type {
             }
             // ----------------------------------------
 
-            // despawn children
             if (self.components.getSingle(ent, Children)) |children| {
                 for (children.items.items) |child| {
                     try self.despawn_with_children(child);
                 }
-
                 children.deinit(self.memtator.world());
+                children.items = .empty;
             }
 
             try self.components.despawn(self.memtator.world(), ent);
@@ -741,23 +740,16 @@ pub fn App(comptime desc: AppDesc) type {
                 return .{};
             }
 
+            /// hot-reload teardown: frees systems and schedule order, keeps `locals`.
+            /// Systems re-register under a stable name hash and must reattach
+            /// their locals (`OnEnter` observers, `kn.Local` state).
             pub fn clear(self: *Self, gpa: std.mem.Allocator) void {
-                self.releaseAllSystemRegistryMemory(gpa);
-            }
-
-            pub fn releaseAllSystemRegistryMemory(self: *Self, gpa: std.mem.Allocator) void {
                 var systemDebugIterator = self.systems.iterator();
                 while (systemDebugIterator.next()) |systemEntry| {
                     gpa.free(systemEntry.value_ptr.debug);
                 }
                 self.systems.deinit(gpa);
                 self.systems = .empty;
-                var localRegistryIterator = self.locals.iterator();
-                while (localRegistryIterator.next()) |localRegistryEntry| {
-                    localRegistryEntry.value_ptr.deinit(gpa);
-                }
-                self.locals.deinit(gpa);
-                self.locals = .empty;
                 var scheduleIterator = self.schedule_order.iterator();
                 while (scheduleIterator.next()) |scheduleEntry| {
                     for (scheduleEntry.value_ptr.systems.items) |*scheduledSystemEntry| {
@@ -769,6 +761,17 @@ pub fn App(comptime desc: AppDesc) type {
                 }
                 self.schedule_order.deinit(gpa);
                 self.schedule_order = .empty;
+            }
+
+            /// full teardown: `clear` plus per-system locals
+            pub fn releaseAllSystemRegistryMemory(self: *Self, gpa: std.mem.Allocator) void {
+                self.clear(gpa);
+                var localRegistryIterator = self.locals.iterator();
+                while (localRegistryIterator.next()) |localRegistryEntry| {
+                    localRegistryEntry.value_ptr.deinit(gpa);
+                }
+                self.locals.deinit(gpa);
+                self.locals = .empty;
             }
 
             pub fn getScheduleTime(self: *SystemRegistry, schedule: anytype) i128 {
@@ -1317,16 +1320,12 @@ pub fn App(comptime desc: AppDesc) type {
         pub const Alloc = struct {
             /// frame arena
             frame: std.mem.Allocator,
-            /// app world arena
-            world: std.mem.Allocator,
-            /// direct gpa access, unmanaged.
             gpa: std.mem.Allocator,
             io: std.Io,
 
             pub fn fromWorld(world: *World) EcsError!Alloc {
                 return .{
                     .frame = world.memtator.frame(),
-                    .world = world.memtator.world(),
                     .gpa = world.memtator.parent,
                     .io = world.io,
                 };
@@ -2466,22 +2465,57 @@ pub fn ArchType(FlagInt: type) type {
         /// allocate in chunks of:
         chunk_size: usize = 512,
         mask: HeapFlagSet(FlagInt).Set = .initEmpty(),
-        /// Archtable layout |XX = pad
-        /// |ENTITY-SLICE----|XX|C1-SLICE----------|X|C2-SLICE--------- ..
-        /// |ENTITY,ENTITY.. |XX|C1,C1..Tick,Tick..|X|C2,C2..Tick,Tick..
-        bytes: []u8 = undefined,
+        bytes: []u8 = &.{},
         alignment: usize = 0,
-        allocatedTableAlignment: usize = 16,
+        allocated_table_alignment: std.mem.Alignment = .fromByteUnits(16),
         columns: std.ArrayList(ColMeta) = .empty,
-        /// entity -> index
         entity_lookup: std.AutoHashMapUnmanaged(Entity, usize) = .empty,
-        /// comp hash -> comps index
-        column_lookup: std.AutoHashMapUnmanaged(CompFlag, usize) = .empty,
         len: usize = 0,
         capacity: usize = 0,
 
+        inline fn effectiveBaseAlignment(self: *const Self) usize {
+            if (self.alignment == 0) return @alignOf(Entity);
+            return self.alignment;
+        }
+
+        inline fn tableBufferAlignment(self: *const Self) std.mem.Alignment {
+            return std.mem.Alignment.fromByteUnits(@max(self.alignment, 16));
+        }
+
+        inline fn columnTickBase(meta: *const ColMeta, capacity: usize) usize {
+            return std.mem.alignForward(usize, meta.offset + meta.size * capacity, @alignOf(TickInfo));
+        }
+
+        fn measureTableSize(self: *const Self, flags: *HeapFlagSet(FlagInt), capacity: usize) usize {
+            const base_alignment = self.effectiveBaseAlignment();
+            var running_offset = std.mem.alignForward(usize, @sizeOf(Entity) * capacity, base_alignment);
+            for (self.columns.items) |meta| {
+                const component_info = flags.getId(meta.flag);
+                running_offset = std.mem.alignForward(usize, running_offset, component_info.alignment);
+                running_offset += meta.size * capacity;
+                running_offset = std.mem.alignForward(usize, running_offset, @alignOf(TickInfo));
+                running_offset += @sizeOf(TickInfo) * capacity;
+            }
+            return running_offset;
+        }
+
+        fn assignTableOffsets(self: *Self, flags: *HeapFlagSet(FlagInt), capacity: usize) usize {
+            const base_alignment = self.effectiveBaseAlignment();
+            var running_offset = std.mem.alignForward(usize, @sizeOf(Entity) * capacity, base_alignment);
+            for (self.columns.items) |*meta| {
+                const component_info = flags.getId(meta.flag);
+                running_offset = std.mem.alignForward(usize, running_offset, component_info.alignment);
+                meta.offset = running_offset;
+                running_offset += meta.size * capacity;
+                running_offset = std.mem.alignForward(usize, running_offset, @alignOf(TickInfo));
+                running_offset += @sizeOf(TickInfo) * capacity;
+            }
+            return running_offset;
+        }
+
         pub fn addComp(self: *Self, gpa: std.mem.Allocator, flags: *HeapFlagSet(FlagInt), flag: CompFlag) !void {
             assert(self.len == 0);
+            assert(self.capacity == 0);
             if (self.mask.contains(flag)) return;
 
             const id = flags.getId(flag);
@@ -2500,56 +2534,62 @@ pub fn ArchType(FlagInt: type) type {
 
             self.mask.insert(flag);
             try self.columns.append(gpa, col_meta);
-            try self.column_lookup.put(gpa, flag, self.columns.items.len - 1);
-            self.calcTableOffsets(flags);
+            _ = self.assignTableOffsets(flags, self.capacity);
         }
 
         pub fn removeComp(self: *Self, flags: *HeapFlagSet(FlagInt), flag: CompFlag) void {
             assert(self.len == 0);
+            assert(self.capacity == 0);
             self.mask.remove(flag);
 
-            const last_comp_meta = self.columns.items[self.columns.items.len - 1];
-            const en = self.column_lookup.fetchRemove(flag).?;
-
-            assert(self.columns.items.len > 0);
-
-            // TODO:
-            // handle empty archtype case: last comp = removed comp
-            // assert(en.key != last_comp_meta_hash);
-            // swap remove with last comp
-            _ = self.columns.swapRemove(en.value);
-
-            // update last comp lookup
-            if (en.key != last_comp_meta.flag) {
-                const lookup_entry = self.column_lookup.getPtr(last_comp_meta.flag).?;
-                lookup_entry.* = en.value;
+            var removed_index: usize = 0;
+            var found_removed_column = false;
+            for (self.columns.items, 0..) |column_meta, column_index| {
+                if (column_meta.flag == flag) {
+                    removed_index = column_index;
+                    found_removed_column = true;
+                    break;
+                }
             }
+            assert(found_removed_column);
 
-            self.calcTableOffsets(flags);
+            _ = self.columns.swapRemove(removed_index);
+            _ = self.assignTableOffsets(flags, self.capacity);
         }
 
         pub fn remove(self: *Self, gpa: std.mem.Allocator, entity: Entity) !void {
+            const removed_index = self.entity_lookup.fetchRemove(entity) orelse return EcsError.EntityNotFound;
+            assert(removed_index.value < self.len);
+            self.destroyOwnedChildrenAtRow(gpa, removed_index.value);
+            try self.swapRemoveRowPreservingOwned(gpa, removed_index.value);
+        }
+
+        fn destroyOwnedChildrenAtRow(self: *Self, gpa: std.mem.Allocator, row_index: usize) void {
+            const children_meta = self.getMetaByHash(hashType(Children)) orelse return;
+            const component_offset = children_meta.offset + children_meta.size * row_index;
+            const children_ptr: *Children = @ptrCast(@alignCast(self.bytes[component_offset .. component_offset + children_meta.size]));
+            children_ptr.items.deinit(gpa);
+        }
+
+        fn swapRemoveRowPreservingOwned(self: *Self, gpa: std.mem.Allocator, removed_index: usize) !void {
             assert(self.len > 0);
-
-            // remove entity from lookup
-            const en = self.entity_lookup.fetchRemove(entity) orelse return EcsError.EntityNotFound;
-            assert(en.value < self.len);
-
+            assert(removed_index < self.len);
             defer self.len -= 1;
-
-            if (en.value == self.len - 1) return;
-
-            // Get the entity that will be moved from the last position
+            if (removed_index == self.len - 1) return;
             const moved_entity = self.getEntity(self.len - 1);
-
-            // swap remove entity + components
-            self.swapRemoveEntitiy(en.value);
+            self.swapRemoveEntity(removed_index);
             for (self.columns.items) |*meta| {
-                self.swapRemoveComp(en.value, meta);
+                self.swapRemoveComp(removed_index, meta);
             }
+            self.neutralizeStaleOwnedChildrenAtRow(self.len - 1);
+            try self.entity_lookup.put(gpa, moved_entity, removed_index);
+        }
 
-            // Update the entity lookup for the moved entity
-            try self.entity_lookup.put(gpa, moved_entity, en.value);
+        fn neutralizeStaleOwnedChildrenAtRow(self: *Self, stale_row_index: usize) void {
+            const children_meta = self.getMetaByHash(hashType(Children)) orelse return;
+            const component_offset = children_meta.offset + children_meta.size * stale_row_index;
+            const children_ptr: *Children = @ptrCast(@alignCast(self.bytes[component_offset .. component_offset + children_meta.size]));
+            children_ptr.* = .{};
         }
 
         pub fn put(self: *Self, gpa: std.mem.Allocator, flags: *HeapFlagSet(FlagInt), tick: u32, entity: Entity, bundle: anytype) !void {
@@ -2557,41 +2597,49 @@ pub fn ArchType(FlagInt: type) type {
                 try self.setCapacity(gpa, flags, self.capacity + self.chunk_size);
             }
 
-            var is_new = false;
+            var row_is_new = false;
+            var wrote_owned_children_for_rollback = false;
             const index: usize = blk: {
                 const res = try self.entity_lookup.getOrPut(gpa, entity);
                 if (res.found_existing) break :blk res.value_ptr.*;
-
                 res.value_ptr.* = self.len;
                 const offset = @sizeOf(Entity) * self.len;
                 @memcpy(self.bytes[offset .. offset + @sizeOf(Entity)], std.mem.asBytes(&entity));
-
-                is_new = true;
+                row_is_new = true;
                 self.len += 1;
-                errdefer self.len -= 1;
                 break :blk res.value_ptr.*;
+            };
+            errdefer if (row_is_new) {
+                if (wrote_owned_children_for_rollback) {
+                    self.destroyOwnedChildrenAtRow(gpa, index);
+                }
+                self.len -= 1;
+                _ = self.entity_lookup.remove(entity);
             };
 
             assert(self.capacity > index);
 
             inline for (bundle) |comp| {
-
-                // skip tuples, tuple = child entity
                 if (isTuple(@TypeOf(comp))) continue;
-
-                // TODO: maybe should not create new entries?
                 const flag = flags.getFlag(@TypeOf(comp));
                 const meta = self.getMeta(flag).?;
-
+                if (!row_is_new and @TypeOf(comp) == Children) {
+                    const old_ptr: *Children = @ptrCast(@alignCast(self.getSingleRaw(index, meta)));
+                    old_ptr.items.deinit(gpa);
+                }
                 self.putRaw(tick, tick, index, meta, std.mem.asBytes(&comp));
+                if (@TypeOf(comp) == Children) {
+                    wrote_owned_children_for_rollback = true;
+                }
             }
         }
 
-        pub inline fn putRaw(self: *Self, changed_tick: u32, added_tick: u32, index: usize, meta: *const ColMeta, bytes: []const u8) void {
-            assert(self.capacity >= index);
+        pub inline fn putRaw(self: *Self, added_tick: u32, changed_tick: u32, index: usize, meta: *const ColMeta, bytes: []const u8) void {
+            assert(index < self.capacity);
             const comp_offset = meta.offset + meta.size * index;
             @memcpy(self.bytes[comp_offset .. comp_offset + meta.size], bytes);
-            const tick_offset = meta.offset + meta.size * self.capacity + @sizeOf(TickInfo) * index;
+            const aligned_tick_base = Self.columnTickBase(meta, self.capacity);
+            const tick_offset = aligned_tick_base + @sizeOf(TickInfo) * index;
             @memcpy(self.bytes[tick_offset .. tick_offset + @sizeOf(TickInfo)], std.mem.asBytes(&TickInfo{
                 .added = added_tick,
                 .changed = changed_tick,
@@ -2603,11 +2651,16 @@ pub fn ArchType(FlagInt: type) type {
                 try self.setCapacity(gpa, flags, self.capacity + self.chunk_size);
             }
 
+            // const already_present = self.entity_lookup.contains(entity);
             const index = try self.putEntity(gpa, entity);
             assert(self.capacity >= index);
 
             const flag = flags.getFlag(@TypeOf(comp));
             const meta = self.getMeta(flag).?;
+            // if (already_present and @TypeOf(comp) == Children) {
+            //     const old_ptr: *Children = @ptrCast(@alignCast(self.getSingleRaw(index, meta)));
+            //     old_ptr.items.deinit(gpa);
+            // }
             const bytes: []const u8 = @alignCast(std.mem.asBytes(&comp));
             self.putRaw(tick, tick, index, meta, bytes);
         }
@@ -2645,12 +2698,12 @@ pub fn ArchType(FlagInt: type) type {
             return @ptrCast(@alignCast(self.getSingleRaw(index, meta)));
         }
 
-        /// updates the `changed` tick
         pub inline fn getSingleAndUpdate(self: *Self, flags: *HeapFlagSet(FlagInt), tick: u32, entity: Entity, comptime C: type) EcsError!*C {
             const index = self.entity_lookup.get(entity) orelse return EcsError.EntityNotFound;
             const flag = flags.getFlag(C);
             const meta = self.getMeta(flag) orelse return EcsError.ComponentNotFound;
-            const tick_offset = meta.offset + meta.size * self.capacity + @sizeOf(TickInfo) * index;
+            const aligned_tick_base = Self.columnTickBase(meta, self.capacity);
+            const tick_offset = aligned_tick_base + @sizeOf(TickInfo) * index;
             @memcpy(self.bytes[tick_offset + 4 .. tick_offset + 8], std.mem.asBytes(&tick));
             return @ptrCast(@alignCast(self.getSingleRaw(index, meta)));
         }
@@ -2658,7 +2711,8 @@ pub fn ArchType(FlagInt: type) type {
         pub inline fn upateChanged(self: *Self, flags: *HeapFlagSet(FlagInt), tick: u32, index: usize, comptime C: type) void {
             const flag = flags.getFlag(C);
             const meta = self.getMeta(flag).?;
-            const tick_offset = meta.offset + meta.size * self.capacity + @sizeOf(TickInfo) * index;
+            const aligned_tick_base = Self.columnTickBase(meta, self.capacity);
+            const tick_offset = aligned_tick_base + @sizeOf(TickInfo) * index;
             @memcpy(self.bytes[tick_offset + 4 .. tick_offset + 8], std.mem.asBytes(&tick));
         }
 
@@ -2671,7 +2725,8 @@ pub fn ArchType(FlagInt: type) type {
 
         pub inline fn getTickInfo(self: *Self, index: usize, meta: *const ColMeta) *const TickInfo {
             assert(self.len > index);
-            const tick_offset = meta.offset + meta.size * self.capacity + @sizeOf(TickInfo) * index;
+            const aligned_tick_base = Self.columnTickBase(meta, self.capacity);
+            const tick_offset = aligned_tick_base + @sizeOf(TickInfo) * index;
             return @ptrCast(@alignCast(self.bytes[tick_offset .. tick_offset + @sizeOf(TickInfo)]));
         }
 
@@ -2694,54 +2749,42 @@ pub fn ArchType(FlagInt: type) type {
         ) !void {
             assert(@intFromPtr(self) != @intFromPtr(dst));
             assert(dst.capacity >= dst.len);
-
-            // For adding components: dst should contain all of src's components
-            // For removing components: src should contain all of dst's components
             const intersection = self.mask.intersectWith(dst.mask);
             assert(intersection.eql(self.mask) or intersection.eql(dst.mask));
             const src_index = self.entity_lookup.get(entity) orelse return EcsError.EntityNotFound;
-
-            // ensure capacity of target arch
             if (dst.len >= dst.capacity) {
                 try dst.setCapacity(gpa, flags, dst.capacity + dst.chunk_size);
             }
-
             const dst_index = try dst.putEntity(gpa, entity);
-            var skipped: u32 = 0;
+            errdefer _ = dst.entity_lookup.remove(entity);
+            errdefer dst.len -= 1;
+            var skipped_count: u32 = 0;
+            var skipped_is_owned_children = false;
             for (self.columns.items) |*meta| {
                 const data = self.getSingleRawConst(src_index, meta);
                 const info = self.getTickInfo(src_index, meta);
-
                 const dst_meta = dst.getMeta(meta.flag) orelse {
-                    skipped += 1;
+                    skipped_count += 1;
+                    if (meta.hash == hashType(Children)) skipped_is_owned_children = true;
                     continue;
                 };
-
-                dst.putRaw(info.changed, info.added, dst_index, dst_meta, data);
+                dst.putRaw(info.added, info.changed, dst_index, dst_meta, data);
             }
-
-            if (skipped >= 2) {
-                for (self.columns.items) |*m| {
-                    _ = dst.getMeta(m.flag) orelse {
-                        std.debug.print("{s} ", .{flags.getId(m.flag).name});
-                    };
-                }
-                std.debug.print("\n", .{});
+            assert(skipped_count < 2);
+            if (skipped_is_owned_children) {
+                self.destroyOwnedChildrenAtRow(gpa, src_index);
             }
-
-            // generally there should only be one comp missing from the target
-            assert(skipped < 2);
-
-            try self.remove(gpa, entity);
+            _ = self.entity_lookup.remove(entity);
+            try self.swapRemoveRowPreservingOwned(gpa, src_index);
         }
 
         inline fn swapRemoveComp(self: *Self, index: usize, meta: *ColMeta) void {
             assert(self.len > 0);
-
             const remove_offset = meta.offset + meta.size * index;
             const last_offset = meta.offset + meta.size * (self.len - 1);
-            const tick_remove_offset = meta.offset + meta.size * self.capacity + @sizeOf(TickInfo) * index;
-            const tick_last_offset = meta.offset + meta.size * self.capacity + @sizeOf(TickInfo) * (self.len - 1);
+            const aligned_tick_base = Self.columnTickBase(meta, self.capacity);
+            const tick_remove_offset = aligned_tick_base + @sizeOf(TickInfo) * index;
+            const tick_last_offset = aligned_tick_base + @sizeOf(TickInfo) * (self.len - 1);
 
             @memcpy(
                 self.bytes[remove_offset .. remove_offset + meta.size],
@@ -2754,7 +2797,7 @@ pub fn ArchType(FlagInt: type) type {
             );
         }
 
-        inline fn swapRemoveEntitiy(self: *Self, index: usize) void {
+        inline fn swapRemoveEntity(self: *Self, index: usize) void {
             assert(self.len > 0);
 
             const ent_size = @sizeOf(Entity);
@@ -2769,10 +2812,9 @@ pub fn ArchType(FlagInt: type) type {
 
         pub fn cloneEmpty(self: *const Self, gpa: std.mem.Allocator) !Self {
             var clone = Self{};
-            clone.bytes = undefined;
+            clone.bytes = &.{};
             clone.mask = self.mask;
             clone.alignment = self.alignment;
-            clone.column_lookup = try self.column_lookup.clone(gpa);
             clone.columns = try self.columns.clone(gpa);
             clone.chunk_size = self.chunk_size;
             return clone;
@@ -2925,99 +2967,74 @@ pub fn ArchType(FlagInt: type) type {
             return metas;
         }
 
-        /// calc table offsets per comp
         inline fn calcTableOffsets(self: *Self, flags: *HeapFlagSet(FlagInt)) void {
             assert(self.len == 0);
-            // Ensure entity section is aligned to the maximum component alignment
-            var offset = std.mem.alignForward(usize, @sizeOf(Entity) * self.capacity, self.alignment);
-            for (self.columns.items) |*meta| {
-                const typeId = flags.getId(meta.flag);
-                offset = std.mem.alignForward(usize, offset, typeId.alignment);
-                meta.offset = offset;
-                offset += meta.size * self.capacity + @sizeOf(TickInfo) * self.capacity;
-            }
+            _ = self.assignTableOffsets(flags, self.capacity);
         }
 
         pub fn setCapacity(self: *Self, gpa: std.mem.Allocator, flags: *HeapFlagSet(FlagInt), new_capacity: usize) !void {
             assert(new_capacity >= self.len);
-            const desiredTableAlignmentValue = @max(self.alignment, 16);
-            const lifetimeTableBufferAlignment = std.mem.Alignment.fromByteUnits(desiredTableAlignmentValue);
-            var size = std.mem.alignForward(usize, @sizeOf(Entity) * new_capacity, self.alignment);
-            var offset = size;
-            for (self.columns.items) |meta| {
-                const typeId = flags.getId(meta.flag);
-                offset = std.mem.alignForward(usize, offset, typeId.alignment);
-                offset += meta.size * new_capacity + @sizeOf(TickInfo) * new_capacity;
-            }
-            size = offset;
-
-            const freshlyAllocatedTableBytes = (gpa.rawAlloc(
-                size,
-                lifetimeTableBufferAlignment,
+            const lifetime_table_buffer_alignment = self.tableBufferAlignment();
+            const required_table_size = self.measureTableSize(flags, new_capacity);
+            const freshly_allocated_table_bytes = (gpa.rawAlloc(
+                required_table_size,
+                lifetime_table_buffer_alignment,
                 @returnAddress(),
-            ) orelse return error.OutOfMemory)[0..size];
-
+            ) orelse return error.OutOfMemory)[0..required_table_size];
             if (self.capacity == 0) {
-                self.bytes = freshlyAllocatedTableBytes;
+                self.bytes = freshly_allocated_table_bytes;
                 self.capacity = new_capacity;
-                self.allocatedTableAlignment = desiredTableAlignmentValue;
-                self.calcTableOffsets(flags);
+                self.allocated_table_alignment = lifetime_table_buffer_alignment;
+                _ = self.assignTableOffsets(flags, self.capacity);
                 return;
             }
-
             const entity_size = @sizeOf(Entity) * self.len;
-            @memcpy(freshlyAllocatedTableBytes[0..entity_size], self.bytes[0..entity_size]);
-
-            var new_offset = std.mem.alignForward(usize, @sizeOf(Entity) * new_capacity, self.alignment);
-
+            @memcpy(freshly_allocated_table_bytes[0..entity_size], self.bytes[0..entity_size]);
+            const base_alignment = self.effectiveBaseAlignment();
+            var running_offset = std.mem.alignForward(usize, @sizeOf(Entity) * new_capacity, base_alignment);
             for (self.columns.items) |*meta| {
-                const typeId = flags.getId(meta.flag);
-                new_offset = std.mem.alignForward(usize, new_offset, typeId.alignment);
-
-                const old_comp_offset = meta.offset;
+                const component_info = flags.getId(meta.flag);
+                running_offset = std.mem.alignForward(usize, running_offset, component_info.alignment);
+                const old_component_offset = meta.offset;
+                const old_tick_base = Self.columnTickBase(meta, self.capacity);
                 const copy_size = meta.size * self.len;
                 @memcpy(
-                    freshlyAllocatedTableBytes[new_offset .. new_offset + copy_size],
-                    self.bytes[old_comp_offset .. old_comp_offset + copy_size],
+                    freshly_allocated_table_bytes[running_offset .. running_offset + copy_size],
+                    self.bytes[old_component_offset .. old_component_offset + copy_size],
                 );
-
-                meta.offset = new_offset;
-
-                const old_tick_offset = old_comp_offset + meta.size * self.capacity;
-                new_offset += meta.size * new_capacity;
-
+                meta.offset = running_offset;
+                running_offset += meta.size * new_capacity;
+                running_offset = std.mem.alignForward(usize, running_offset, @alignOf(TickInfo));
                 const tick_size = @sizeOf(TickInfo) * self.len;
                 @memcpy(
-                    freshlyAllocatedTableBytes[new_offset .. new_offset + tick_size],
-                    self.bytes[old_tick_offset .. old_tick_offset + tick_size],
+                    freshly_allocated_table_bytes[running_offset .. running_offset + tick_size],
+                    self.bytes[old_tick_base .. old_tick_base + tick_size],
                 );
-
-                new_offset += @sizeOf(TickInfo) * new_capacity;
+                running_offset += @sizeOf(TickInfo) * new_capacity;
             }
-
-            gpa.rawFree(self.bytes, std.mem.Alignment.fromByteUnits(self.allocatedTableAlignment), @returnAddress());
-            self.bytes = freshlyAllocatedTableBytes;
+            gpa.rawFree(self.bytes, self.allocated_table_alignment, @returnAddress());
+            self.bytes = freshly_allocated_table_bytes;
             self.capacity = new_capacity;
-            self.allocatedTableAlignment = desiredTableAlignmentValue;
+            self.allocated_table_alignment = lifetime_table_buffer_alignment;
         }
 
         pub fn releaseAllArchTableMemory(self: *Self, gpa: std.mem.Allocator) void {
-            for (self.columns.items) |*columnMeta| {
-                if (columnMeta.hash == hashType(Children)) {
-                    var rowIndex: usize = 0;
-                    while (rowIndex < self.len) : (rowIndex += 1) {
-                        const componentOffset = columnMeta.offset + columnMeta.size * rowIndex;
-                        const childrenPtr: *Children = @ptrCast(@alignCast(self.bytes[componentOffset .. componentOffset + columnMeta.size]));
-                        childrenPtr.items.deinit(gpa);
+            for (self.columns.items) |*column_meta| {
+                if (column_meta.hash == hashType(Children)) {
+                    var row_index: usize = 0;
+                    while (row_index < self.len) : (row_index += 1) {
+                        const component_offset = column_meta.offset + column_meta.size * row_index;
+                        const children_ptr: *Children = @ptrCast(@alignCast(self.bytes[component_offset .. component_offset + column_meta.size]));
+                        children_ptr.items.deinit(gpa);
                     }
                 }
             }
             if (self.capacity > 0) {
-                gpa.rawFree(self.bytes, std.mem.Alignment.fromByteUnits(self.allocatedTableAlignment), @returnAddress());
+                gpa.rawFree(self.bytes, self.allocated_table_alignment, @returnAddress());
             }
+            self.bytes = &.{};
             self.columns.deinit(gpa);
             self.entity_lookup.deinit(gpa);
-            self.column_lookup.deinit(gpa);
             self.len = 0;
             self.capacity = 0;
         }
@@ -3109,10 +3126,13 @@ fn ComponentRegistry(FlagInt: type) type {
             var mask = if (current_arch_id) |aid| self.archtypes.items[aid].mask else HeapFlagSet(FlagInt).Set.initEmpty();
 
             if (mask.contains(flag)) {
-                // overwrite existing component
                 const arch = &self.archtypes.items[current_arch_id.?];
                 const meta = arch.getMeta(flag).?;
                 const index = arch.entity_lookup.get(entity) orelse return EcsError.EntityNotFound;
+                if (meta.hash == hashType(Children)) {
+                    const old_children: *Children = @ptrCast(@alignCast(arch.getSingleRaw(index, meta)));
+                    old_children.items.deinit(allocator);
+                }
                 arch.putRaw(tick, tick, index, meta, bytes);
                 return;
             }
@@ -3175,9 +3195,10 @@ fn ComponentRegistry(FlagInt: type) type {
             const same_arch = mask.eql(old_mask);
 
             const next_arch_id = try self.archtypes_lookup.getOrPut(allocator, mask);
-            if (!next_arch_id.found_existing and !same_arch) {
+            assert(!same_arch or is_new_entity or next_arch_id.found_existing);
+            if (!next_arch_id.found_existing) {
                 if (is_new_entity) {
-                    try self.archtypes.append(allocator, .{});
+                    try self.archtypes.append(allocator, .{ .chunk_size = CHUNK_SIZE });
                 } else {
                     const cloned = try self.archtypes.items[current_arch_id.?].cloneEmpty(allocator);
                     try self.archtypes.append(allocator, cloned);
