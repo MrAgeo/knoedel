@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const assert = std.debug.assert;
 const cprint = std.fmt.comptimePrint;
+const json_codec = @import("json_codec.zig");
 
 pub const AppDesc = @import("root.zig").AppDesc;
 
@@ -1424,6 +1425,12 @@ pub fn App(comptime desc: AppDesc) type {
                 try self.reg.add(self.world.io, self.frame_gpa, cmd);
             }
 
+            /// remove a component from an entity by runtime flag
+            pub fn removeRaw(self: *const Self, entity: Entity, flag: HeapFlagSet(desc.FlagInt).Flag) EcsError!void {
+                const cmd = try removeRawCommand(self.frame_gpa, entity, flag);
+                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+            }
+
             /// add a resource, overwritting existing (calls `deinit` with alloc on res)
             pub fn insertResource(self: *const Self, comp: anytype) EcsError!void {
                 const cmd = try insertResourceCommand(self.frame_gpa, comp);
@@ -1659,6 +1666,33 @@ pub fn App(comptime desc: AppDesc) type {
                         if (world.isValid(a.ent)) {
                             try world.components.addRaw(world.memtator.world(), world.world_tick, a.ent, a.flag, a.data);
                         }
+                    }
+                }).run,
+            };
+        }
+
+        fn removeRawCommand(allocator: std.mem.Allocator, entity: Entity, flag: HeapFlagSet(desc.FlagInt).Flag) EcsError!Command {
+            const CompFlag = HeapFlagSet(desc.FlagInt).Flag;
+            const Args = struct {
+                ent: Entity,
+                flag: CompFlag,
+            };
+
+            const args = try allocator.create(Args);
+            args.* = .{ .ent = entity, .flag = flag };
+
+            return Command{
+                .ptr = args,
+                .run = (struct {
+                    fn run(ctx: *anyopaque, world: *World) EcsError!void {
+                        const a: *Args = @ptrCast(@alignCast(ctx));
+                        if (!world.isValid(a.ent)) return;
+                        if (world.hooks.remove_hooks.contains(a.flag)) {
+                            if (world.components.getSingleOpaque(a.ent, a.flag)) |comp| {
+                                try world.hooks.runRemoveHook(a.flag, comp, a.ent, world);
+                            }
+                        }
+                        try world.components.removeByFlag(world.memtator.world(), a.ent, a.flag);
                     }
                 }).run,
             };
@@ -2312,6 +2346,9 @@ pub fn HeapFlagSet(comptime FlagInt: type) type {
             size: usize,
             alignment: usize,
             print: ?*const fn (*const anyopaque, *std.Io.Writer) EcsError!void,
+            /// Comptime-generated JSON mapping (write/schema/apply), null when
+            /// no field of the type is JSON-representable.
+            json: ?*const json_codec.JsonVTable = null,
         };
 
         pub inline fn getFlagFromHash(self: *const Self, hash: u32) ?Flag {
@@ -2325,7 +2362,14 @@ pub fn HeapFlagSet(comptime FlagInt: type) type {
 
             const len = @atomicLoad(usize, &self.registered_len, .acquire);
             for (self.registered_hash[0..len], 0..) |h, i| {
-                if (h == hash) return @enumFromInt(i);
+                if (h == hash) {
+                    // Refresh the fn pointers: after a hot reload the world
+                    // persists but the old dylib text is stale. Benign race —
+                    // both old and new pointers stay valid.
+                    self.registered_buf[i].print = comptime makePrintFn(T);
+                    self.registered_buf[i].json = comptime makeJsonPtr(T);
+                    return @enumFromInt(i);
+                }
             }
 
             while (!self.registration_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -2333,7 +2377,11 @@ pub fn HeapFlagSet(comptime FlagInt: type) type {
 
             const locked_len = @atomicLoad(usize, &self.registered_len, .acquire);
             for (self.registered_hash[0..locked_len], 0..) |h, i| {
-                if (h == hash) return @enumFromInt(i);
+                if (h == hash) {
+                    self.registered_buf[i].print = comptime makePrintFn(T);
+                    self.registered_buf[i].json = comptime makeJsonPtr(T);
+                    return @enumFromInt(i);
+                }
             }
 
             const index = locked_len;
@@ -2345,28 +2393,44 @@ pub fn HeapFlagSet(comptime FlagInt: type) type {
                 .hash = hash,
                 .size = @sizeOf(T),
                 .alignment = @alignOf(T),
-                .print = (struct {
-                    fn fmt(ptr: *const anyopaque, w: *std.Io.Writer) EcsError!void {
-                        const comp: *const T = @ptrCast(@alignCast(ptr));
-                        if (@hasDecl(T, "fmt")) {
-                            try comp.fmt(w);
-                        } else {
-                            switch (@typeInfo(T)) {
-                                .@"struct" => |str| {
-                                    inline for (str.fields, 0..) |field, i| {
-                                        try w.print(".{s}: {any},", .{ field.name, @field(comp, field.name) });
-                                        if (i < str.fields.len -| 1) try w.print("\n", .{});
-                                    }
-                                },
-                                else => try w.writeAll("uknown"),
-                            }
-                        }
-                    }
-                }).fmt,
+                .print = comptime makePrintFn(T),
+                .json = comptime makeJsonPtr(T),
             };
 
             @atomicStore(usize, &self.registered_len, index + 1, .release);
             return @enumFromInt(index);
+        }
+
+        fn makePrintFn(comptime T: type) ?*const fn (*const anyopaque, *std.Io.Writer) EcsError!void {
+            return (struct {
+                fn fmt(ptr: *const anyopaque, w: *std.Io.Writer) EcsError!void {
+                    const comp: *const T = @ptrCast(@alignCast(ptr));
+                    if (@hasDecl(T, "fmt")) {
+                        try comp.fmt(w);
+                    } else {
+                        switch (@typeInfo(T)) {
+                            .@"struct" => |str| {
+                                inline for (str.fields, 0..) |field, i| {
+                                    try w.print(".{s}: {any},", .{ field.name, @field(comp, field.name) });
+                                    if (i < str.fields.len -| 1) try w.print("\n", .{});
+                                }
+                            },
+                            else => try w.writeAll("uknown"),
+                        }
+                    }
+                }
+            }).fmt;
+        }
+
+        fn makeJsonPtr(comptime T: type) ?*const json_codec.JsonVTable {
+            const Impl = json_codec.Codec(T) orelse return null;
+            const default_ok = comptime json_codec.defaultable(T);
+            return &(json_codec.JsonVTable{
+                .write = Impl.write,
+                .schema = Impl.schema,
+                .apply = Impl.apply,
+                .init = if (default_ok) &Impl.init else null,
+            });
         }
 
         pub fn getId(self: *const Self, flag: Flag) *const Info {
@@ -3247,18 +3311,29 @@ fn ComponentRegistry(FlagInt: type) type {
             return self.archtypes.items[arch_id].getSingleRaw(index, meta).ptr;
         }
 
-        pub fn remove(self: *Self, allocator: std.mem.Allocator, entity: Entity, comptime C: type) !void {
+        /// Raw pointer to a live component, with the changed tick bumped so
+        /// change-detection systems pick up the mutation. Used by the debug
+        /// server to apply JSON patches in place.
+        pub fn getSingleOpaqueAndUpdate(self: *Self, tick: u32, entity: Entity, flag: CompFlag) ?*anyopaque {
+            const arch_id = self.entity_lookup.get(entity) orelse return null;
+            const arch = &self.archtypes.items[arch_id];
+            const meta = arch.getMeta(flag) orelse return null;
+            const index = arch.entity_lookup.get(entity) orelse return null;
+            const aligned_tick_base = ArchType(FlagInt).columnTickBase(meta, arch.capacity);
+            const tick_offset = aligned_tick_base + @sizeOf(ArchType(FlagInt).TickInfo) * index;
+            @memcpy(arch.bytes[tick_offset + 4 .. tick_offset + 8], std.mem.asBytes(&tick));
+            return arch.getSingleRaw(index, meta).ptr;
+        }
+
+        /// Remove one component from an entity by runtime flag.
+        /// No-op when the entity does not carry the component.
+        pub fn removeByFlag(self: *Self, allocator: std.mem.Allocator, entity: Entity, flag: CompFlag) !void {
             const current_arch_id = self.entity_lookup.get(entity) orelse return EcsError.EntityNotFound;
 
-            // linear lookup in current arch is faster then the registry
-            const meta = self.archtypes.items[current_arch_id].getMetaByHash(hashType(C)) orelse {
-                return;
-            };
+            const current_arch = &self.archtypes.items[current_arch_id];
+            if (current_arch.getMeta(flag) == null) return;
 
-            const flag = meta.flag;
-            const mask = self.archtypes.items[current_arch_id].mask;
-
-            // If mask doesn't have this flag, the component was already removed. Return silently.
+            const mask = current_arch.mask;
             if (!mask.contains(flag)) return;
 
             var new_mask = mask;
@@ -3278,6 +3353,17 @@ fn ComponentRegistry(FlagInt: type) type {
             try self.archtypes.items[current_arch_id].moveTo(allocator, &self.component_flags, entity, new_arch);
 
             _ = try self.entity_lookup.put(allocator, entity, new_arch_id.value_ptr.*);
+        }
+
+        pub fn remove(self: *Self, allocator: std.mem.Allocator, entity: Entity, comptime C: type) !void {
+            const current_arch_id = self.entity_lookup.get(entity) orelse return EcsError.EntityNotFound;
+
+            // linear lookup in current arch is faster then the registry
+            const meta = self.archtypes.items[current_arch_id].getMetaByHash(hashType(C)) orelse {
+                return;
+            };
+
+            return self.removeByFlag(allocator, entity, meta.flag);
         }
 
         pub fn despawn(self: *Self, allocator: std.mem.Allocator, entity: Entity) !void {
