@@ -183,37 +183,43 @@ test "scheduler ignores skipped active dependencies" {
     const Ran = struct { count: u32 = 0 };
 
     const app = App(.{});
-    var world = try app.init(std.testing.allocator, testIo());
-    defer world.deinit();
+    inline for (.{ false, true }) |parallel| {
+        var world = try app.init(std.testing.allocator, testIo());
+        defer world.deinit();
 
-    try world.addResource(Counter{});
-    try world.addResource(Ran{});
+        try world.addResource(Counter{});
+        try world.addResource(Ran{});
 
-    const Schedule = enum { update };
+        const Schedule = enum { update };
 
-    const condition = (struct {
-        fn run(w: *app, _: *e.ResourceRegistry(u6)) EcsError!bool {
-            const counter = try w.resource(Counter);
-            counter.calls += 1;
-            return counter.calls == 2;
+        const condition = (struct {
+            fn run(w: *app, _: *e.ResourceRegistry(u6)) EcsError!bool {
+                const counter = try w.resource(Counter);
+                counter.calls += 1;
+                return counter.calls == 2;
+            }
+        }).run;
+
+        const first = (struct {
+            fn run() EcsError!void {}
+        }).run;
+
+        const second = (struct {
+            fn run(ran: app.ResMut(Ran)) EcsError!void {
+                ran.inner.count += 1;
+            }
+        }).run;
+
+        try world.addSystemEx(Schedule.update, e.Chain(.{ &first, &second }), &condition);
+        if (parallel) {
+            try world.systems.runPar(Schedule.update, world);
+        } else {
+            try world.systems.run(Schedule.update, world);
         }
-    }).run;
 
-    const first = (struct {
-        fn run() EcsError!void {}
-    }).run;
-
-    const second = (struct {
-        fn run(ran: app.ResMut(Ran)) EcsError!void {
-            ran.inner.count += 1;
-        }
-    }).run;
-
-    try world.addSystemEx(Schedule.update, e.Chain(.{ &first, &second }), &condition);
-    try world.systems.run(Schedule.update, world);
-
-    try expect((try world.resource(Counter)).calls == 2);
-    try expect((try world.resource(Ran)).count == 1);
+        try expect((try world.resource(Counter)).calls == 2);
+        try expect((try world.resource(Ran)).count == 1);
+    }
 }
 
 test "test_resource" {
@@ -627,4 +633,242 @@ test "scene codec exports entities before registered resources" {
     const res = try dst.resource(Res);
     try expect(res.n == 123);
     try expect(dst.resource(OtherRes) == EcsError.ResourceNotFound);
+}
+
+test "archetype growth is geometric and preserves aligned data and ticks" {
+    const Value = struct { n: u64 align(32) };
+    const Tag = struct {};
+    const Mode = enum { bundle, single, raw, migration };
+    inline for (std.meta.tags(Mode)) |mode| {
+        const app = App(.{});
+        const world = try app.init(std.testing.allocator, testIo());
+        defer world.deinit();
+        const gpa = world.memtator.world();
+        const flag = world.components.component_flags.getFlag(Value);
+        var capacity: usize = 0;
+        var allocations: usize = 0;
+        for (0..257) |i| {
+            const ent = world.nextEntityId();
+            const value = Value{ .n = i };
+            switch (mode) {
+                .bundle => try world.components.addBundle(gpa, 3, ent, .{value}),
+                .single => try world.components.add(gpa, 3, ent, value),
+                .raw => try world.components.addRaw(gpa, 3, ent, flag, std.mem.asBytes(&value)),
+                .migration => {
+                    try world.components.add(gpa, 3, ent, value);
+                    try world.components.add(gpa, 5, ent, Tag{});
+                },
+            }
+            const arch = &world.components.archtypes.items[world.components.entity_lookup.get(ent).?];
+            if (arch.capacity != capacity) {
+                capacity = arch.capacity;
+                allocations += 1;
+            }
+        }
+        try expect(allocations <= 4);
+        const query = try app.Query(struct { ent: Entity, value: *const Value }).fromWorld(world);
+        var it = query.iter();
+        var count: usize = 0;
+        while (it.next()) |row| {
+            try std.testing.expectEqual(@as(u64, row.ent.id() - 1), row.value.n);
+            try expect(@intFromPtr(row.value) % 32 == 0);
+            const arch = &world.components.archtypes.items[world.components.entity_lookup.get(row.ent).?];
+            const tick = arch.getTickInfo(arch.entity_lookup.get(row.ent).?, arch.getMeta(flag).?);
+            try std.testing.expectEqual(@as(u32, 3), tick.added);
+            try std.testing.expectEqual(@as(u32, 3), tick.changed);
+            count += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 257), count);
+    }
+}
+
+test "full archetype overwrites retain storage and failed growth leaves no row" {
+    const Value = struct { n: u32 };
+    const Other = struct { n: u32 };
+    const app = App(.{});
+    const world = try app.init(std.testing.allocator, testIo());
+    defer world.deinit();
+    const gpa = world.memtator.world();
+    var first: Entity = .placeholder;
+    for (0..64) |i| {
+        const ent = world.nextEntityId();
+        if (i == 0) first = ent;
+        try world.components.addBundle(gpa, 1, ent, .{ Value{ .n = 1 }, Other{ .n = 2 } });
+    }
+    const arch_id = world.components.entity_lookup.get(first).?;
+    const arch = &world.components.archtypes.items[arch_id];
+    const bytes = arch.bytes.ptr;
+    const capacity = arch.capacity;
+    try std.testing.expectEqual(capacity, arch.len);
+    try world.components.addBundle(gpa, 2, first, .{Value{ .n = 3 }});
+    try world.components.add(gpa, 3, first, Value{ .n = 4 });
+    try arch.putSingle(gpa, &world.components.component_flags, 4, first, Value{ .n = 5 });
+    try expect(arch.bytes.ptr == bytes);
+    try std.testing.expectEqual(capacity, arch.capacity);
+    try std.testing.expectEqual(arch_id, world.components.entity_lookup.get(first).?);
+    try std.testing.expectEqual(@as(usize, 64), world.entityCount());
+    try std.testing.expectEqual(@as(u32, 5), world.components.getSingle(first, Value).?.n);
+    try std.testing.expectEqual(@as(u32, 2), world.components.getSingle(first, Other).?.n);
+
+    // Fail the table allocation after the row lookup succeeds.
+    try arch.entity_lookup.ensureUnusedCapacity(gpa, 1);
+    var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = 0 });
+    const next = world.nextEntityId();
+    try std.testing.expectError(error.OutOfMemory, arch.put(failing.allocator(), &world.components.component_flags, 5, next, .{ Value{ .n = 6 }, Other{ .n = 7 } }));
+    try expect(!arch.entity_lookup.contains(next));
+    try std.testing.expectEqual(@as(usize, 64), arch.len);
+    try expect(arch.bytes.ptr == bytes);
+    try arch.put(gpa, &world.components.component_flags, 5, next, .{ Value{ .n = 6 }, Other{ .n = 7 } });
+    try std.testing.expectEqual(@as(usize, 65), arch.len);
+}
+
+test "local queries initialized at tick zero reuse their match allocation" {
+    const Value = struct { n: u32 };
+    const Tag = struct {};
+    const app = App(.{});
+    const world = try app.init(std.testing.allocator, testIo());
+    defer world.deinit();
+    const gpa = world.memtator.world();
+    var locals: e.ResourceRegistry(u6) = .{};
+    defer locals.deinit(gpa);
+    try world.components.add(gpa, 0, world.nextEntityId(), Value{ .n = 1 });
+    const Q = app.Query(struct { value: *const Value });
+    const first = try Q.fromLocal(world, &locals);
+    const matches = first.state.matched_archtypes.items.ptr;
+    for (0..3) |_| {
+        const query = try Q.fromLocal(world, &locals);
+        try expect(query.state.matched_archtypes.items.ptr == matches);
+        try std.testing.expectEqual(@as(usize, 1), query.count());
+    }
+    world.update();
+    const query = try Q.fromLocal(world, &locals);
+    try expect(query.state.matched_archtypes.items.ptr == matches);
+    try world.components.addBundle(gpa, 1, world.nextEntityId(), .{ Value{ .n = 2 }, Tag{} });
+    const refreshed = try Q.fromLocal(world, &locals);
+    try std.testing.expectEqual(@as(usize, 2), refreshed.count());
+}
+
+test "changed uses query metadata across archetypes and supports unqueried components" {
+    const Value = struct { n: u32 };
+    const Optional = struct { n: u32 };
+    const Outside = struct { n: u32 };
+    const Missing = struct { n: u32 };
+    const Tag = struct {};
+    const app = App(.{});
+    const world = try app.init(std.testing.allocator, testIo());
+    defer world.deinit();
+    const gpa = world.memtator.world();
+    for (0..2) |i| {
+        const ent = world.nextEntityId();
+        try world.components.addBundle(gpa, 3, ent, .{ Value{ .n = 1 }, Optional{ .n = 2 }, Outside{ .n = 3 } });
+        if (i == 1) try world.components.add(gpa, 3, ent, Tag{});
+    }
+    world.world_tick = 10;
+    const Row = struct { ent: Entity, meta: ArchType(u6).Meta, tag: Tag, has_tag: e.Has(Tag), missing: ?*Missing, optional: ?*Optional, value: *Value };
+    const query = try app.Query(Row).fromWorld(world);
+    var it = query.iter();
+    var count: usize = 0;
+    while (it.next()) |row| {
+        try expect(row.missing == null);
+        try expect(row.has_tag.val == (row.ent.id() == 2));
+        row.value.n += 1;
+        row.optional.?.n += 1;
+        it.changed(Value);
+        it.changed(Optional);
+        it.changed(Outside);
+        const arch = &world.components.archtypes.items[world.components.entity_lookup.get(row.ent).?];
+        inline for (.{ Value, Optional, Outside }) |C| {
+            const tick = arch.getTickInfo(arch.entity_lookup.get(row.ent).?, arch.getMetaByHash(e.hashType(C)).?);
+            try std.testing.expectEqual(@as(u32, 3), tick.added);
+            try std.testing.expectEqual(@as(u32, 10), tick.changed);
+        }
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+    it.reset();
+    try expect(it.next() != null);
+    it.changed(Value);
+    const filtered = try app.QueryF(Row, e.Filter.Changed(Value)).fromWorld(world);
+    var filtered_it = filtered.iter();
+    count = 0;
+    while (filtered_it.next()) |_| {
+        filtered_it.changed(Optional);
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), count);
+}
+
+test "scheduler compaction preserves dependencies and order across passes" {
+    const Log = struct {
+        values: std.ArrayList(u8) = .empty,
+        pub fn deinit(self: *@This(), gpa: std.mem.Allocator) void {
+            self.values.deinit(gpa);
+        }
+    };
+    const app = App(.{});
+    const Sys = struct {
+        fn first(log: app.ResMut(Log), alloc: app.Alloc) EcsError!void {
+            try log.inner.values.append(alloc.gpa, 1);
+        }
+        fn second(log: app.ResMut(Log), alloc: app.Alloc, _: app.Commands) EcsError!void {
+            try log.inner.values.append(alloc.gpa, 2);
+        }
+        fn third(log: app.ResMut(Log), alloc: app.Alloc, _: e.Local(struct {})) EcsError!void {
+            try log.inner.values.append(alloc.gpa, 3);
+        }
+    };
+    inline for (.{ false, true }) |parallel| {
+        inline for (.{ false, true }) |chain| {
+            const world = try app.init(std.testing.allocator, testIo());
+            defer world.deinit();
+            try world.addResource(Log{});
+            const Schedule = enum { update };
+            if (chain) {
+                try world.addSystem(Schedule.update, e.Chain(.{ &Sys.first, &Sys.second, &Sys.third }));
+            } else {
+                try world.addSystem(Schedule.update, .{ &Sys.first, &Sys.second, &Sys.third });
+            }
+            const schedule = world.systems.schedule_order.getPtr(0).?;
+            // Put a blocked system first, forcing the sequential scheduler to revisit survivors.
+            if (chain) std.mem.swap(@TypeOf(schedule.systems.items[0]), &schedule.systems.items[0], &schedule.systems.items[1]);
+            if (parallel) {
+                try world.systems.runPar(Schedule.update, world);
+                try std.testing.expectEqual(@as(usize, 3), schedule.batch_count);
+            } else {
+                try world.systems.run(Schedule.update, world);
+            }
+            try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, (try world.resource(Log)).values.items);
+        }
+    }
+}
+
+test "command queue survives frame resets and drains commands appended during flush" {
+    const Value = struct { n: u32 };
+    const app = App(.{});
+    const Enqueue = struct {
+        fn run(_: *anyopaque, world: *app) EcsError!void {
+            const cmd = world.getCommands();
+            _ = try cmd.spawn(.{Value{ .n = 42 }});
+        }
+    };
+    const world = try app.init(std.testing.allocator, testIo());
+    defer world.deinit();
+    const cmd = world.getCommands();
+    for (0..64) |_| _ = try cmd.spawn(.{Value{ .n = 1 }});
+    var context: u8 = 0;
+    try cmd.add(.{ .ptr = &context, .run = Enqueue.run });
+    const queue_ptr = world.commands.queue.items.ptr;
+    const queue_capacity = world.commands.queue.capacity;
+    world.update();
+    try std.testing.expectEqual(@as(usize, 65), world.entityCount());
+    try std.testing.expectEqual(@as(usize, 0), world.commands.queue.items.len);
+    const scratch = try world.memtator.frame().alloc(u8, 8192);
+    @memset(scratch, 0xa5);
+    for (0..3) |_| {
+        const ent = try cmd.spawn(.{Value{ .n = 9 }});
+        try expect(world.commands.queue.items.ptr == queue_ptr);
+        try std.testing.expectEqual(queue_capacity, world.commands.queue.capacity);
+        world.update();
+        try std.testing.expectEqual(@as(u32, 9), world.components.getSingle(ent, Value).?.n);
+    }
 }

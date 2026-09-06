@@ -181,6 +181,7 @@ pub fn App(comptime desc: AppDesc) type {
         pub fn deinit(self: *World) void {
             const gpa = self.memtator.world();
             self.entities.unused.deinit(gpa);
+            self.commands.queue.deinit(gpa);
             self.components.releaseAllComponentRegistryMemory(gpa);
             self.resources.deinit(gpa);
             self.systems.releaseAllSystemRegistryMemory(gpa);
@@ -1076,16 +1077,19 @@ pub fn App(comptime desc: AppDesc) type {
                 }
 
                 while (scheduled_systems.items.len > 0) {
-                    var remove_list: std.ArrayList(usize) = .empty;
-                    for (scheduled_systems.items, 0..) |id, index| {
-                        if (dep_counter.get(id)) |count| if (count > 0) continue;
+                    var remaining: usize = 0;
+                    for (scheduled_systems.items) |id| {
+                        if (dep_counter.get(id)) |count| if (count > 0) {
+                            scheduled_systems.items[remaining] = id;
+                            remaining += 1;
+                            continue;
+                        };
 
                         const sys = self.systems.getPtr(id).?;
                         const locals = self.locals.getPtr(id).?;
 
                         executeSystem(sys, locals, world, 0);
 
-                        try remove_list.append(gpa, index);
                         if (dep_graph.getPtr(id)) |deps| {
                             for (deps.items) |dep_id| {
                                 //reduce dep counter
@@ -1094,11 +1098,8 @@ pub fn App(comptime desc: AppDesc) type {
                         }
                     }
 
-                    if (remove_list.items.len == 0) return EcsError.SystemFailure;
-
-                    for (remove_list.items, 0..) |index, c| {
-                        _ = scheduled_systems.orderedRemove(index - c);
-                    }
+                    if (remaining == scheduled_systems.items.len) return EcsError.SystemFailure;
+                    scheduled_systems.items.len = remaining;
                 }
 
                 const total: i128 = start.untilNow(world.io).raw.toNanoseconds();
@@ -1163,24 +1164,21 @@ pub fn App(comptime desc: AppDesc) type {
                     var batch: std.ArrayList(SystemID) = .empty;
                     var access = Access(desc.FlagInt){};
 
-                    var remove_list: std.ArrayList(usize) = .empty;
-                    var update_deps: std.ArrayList(SystemID) = .empty;
+                    var remaining: usize = 0;
+                    for (scheduled_systems.items) |en| {
+                        if ((dep_counter.get(en.id) orelse 0) > 0 or !access.isCompatible(&en.access)) {
+                            scheduled_systems.items[remaining] = en;
+                            remaining += 1;
+                            continue;
+                        }
 
-                    for (scheduled_systems.items, 0..) |en, index| {
-                        if (dep_counter.get(en.id)) |count| if (count > 0) continue;
-
-                        if (!access.isCompatible(&en.access)) continue;
-
-                        batch.append(gpa, en.id) catch break;
+                        try batch.append(gpa, en.id);
                         access.merge(&en.access);
-
-                        try remove_list.append(gpa, index);
-                        try update_deps.append(gpa, en.id);
                     }
 
                     if (batch.items.len == 0) return EcsError.SystemFailure;
 
-                    for (update_deps.items) |id| {
+                    for (batch.items) |id| {
                         if (dep_graph.getPtr(id)) |deps| {
                             for (deps.items) |dep_id| {
                                 if (dep_counter.getPtr(dep_id)) |count| count.* = count.* -| 1;
@@ -1188,11 +1186,7 @@ pub fn App(comptime desc: AppDesc) type {
                         }
                     }
 
-                    update_deps.clearRetainingCapacity();
-
-                    for (remove_list.items, 0..) |index, c| {
-                        _ = scheduled_systems.orderedRemove(index - c);
-                    }
+                    scheduled_systems.items.len = remaining;
 
                     try batches.append(gpa, batch);
                 }
@@ -1362,7 +1356,7 @@ pub fn App(comptime desc: AppDesc) type {
             pub fn spawn(self: *const Self, bundle: anytype) EcsError!Entity {
                 const entity = self.world.nextEntityId();
                 const cmd = try insertCommand(self.frame_gpa, entity, bundle);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
                 return entity;
             }
 
@@ -1374,19 +1368,19 @@ pub fn App(comptime desc: AppDesc) type {
             /// spawn with a specific pre-claimed entity id
             pub fn spawnWithEntity(self: *const Self, entity: Entity, bundle: anytype) EcsError!void {
                 const cmd = try insertCommand(self.frame_gpa, entity, bundle);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             /// despawns an entity with children recursive
             pub fn despawn(self: *const Self, entity: Entity) EcsError!void {
                 const cmd = try despawnCommand(self.frame_gpa, entity, true);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             /// despawns an entity and unlink their children without despawning them
             pub fn despawnUnlink(self: *const Self, entity: Entity) EcsError!void {
                 const cmd = try despawnCommand(self.frame_gpa, entity, false);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             /// remove one or many components from entity
@@ -1399,57 +1393,57 @@ pub fn App(comptime desc: AppDesc) type {
                         if (!str.is_tuple) @compileError("Components to be removed must be single type or tuple of types");
 
                         const cmd = try removeBundleCommand(self.frame_gpa, entity, C);
-                        try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                        try self.reg.add(self.world.io, self.world_gpa, cmd);
                     },
                     else => {
                         const cmd = try removeCommand(self.frame_gpa, entity, C);
-                        try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                        try self.reg.add(self.world.io, self.world_gpa, cmd);
                     },
                 }
             }
 
             /// add a subcommand
             pub fn add(self: *const Self, cmd: Command) EcsError!void {
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             /// add a component to entity, overwritting existing
             pub fn insert(self: *const Self, entity: Entity, comp: anytype) EcsError!void {
                 const cmd = try insertCommand(self.frame_gpa, entity, comp);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             /// Insert raw component bytes into an entity by flag. Used for deserialization.
             pub fn insertRaw(self: *const Self, entity: Entity, flag: HeapFlagSet(desc.FlagInt).Flag, bytes: []const u8) EcsError!void {
                 const cmd = try insertRawCommand(self.frame_gpa, entity, flag, bytes);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             /// remove a component from an entity by runtime flag
             pub fn removeRaw(self: *const Self, entity: Entity, flag: HeapFlagSet(desc.FlagInt).Flag) EcsError!void {
                 const cmd = try removeRawCommand(self.frame_gpa, entity, flag);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             /// add a resource, overwritting existing (calls `deinit` with alloc on res)
             pub fn insertResource(self: *const Self, comp: anytype) EcsError!void {
                 const cmd = try insertResourceCommand(self.frame_gpa, comp);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             pub fn removeResource(self: *const Self, comp: anytype) EcsError!void {
                 const cmd = try removeResourceCommand(self.frame_gpa, comp);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             pub fn addChild(self: *const Self, parent: Entity, child: Entity) EcsError!void {
                 const cmd = try addChildCommand(self.frame_gpa, parent, child);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             pub fn removeChild(self: *const Self, parent: Entity, child: Entity) EcsError!void {
                 const cmd = try removeChildCommand(self.frame_gpa, parent, child);
-                try self.reg.add(self.world.io, self.frame_gpa, cmd);
+                try self.reg.add(self.world.io, self.world_gpa, cmd);
             }
 
             pub fn fromWorld(world: *World) EcsError!Self {
@@ -1468,6 +1462,7 @@ pub fn App(comptime desc: AppDesc) type {
             mutex: std.Io.Mutex = .init,
             queue: std.ArrayList(Command) = .empty,
 
+            /// Queue storage must use the world allocator; payloads may use the frame allocator.
             pub fn add(self: *Self, io: std.Io, allocator: std.mem.Allocator, cmd: Command) EcsError!void {
                 try self.mutex.lock(io);
                 defer self.mutex.unlock(io);
@@ -1485,7 +1480,7 @@ pub fn App(comptime desc: AppDesc) type {
 
                     i += 1;
                 }
-                self.queue = .empty;
+                self.queue.clearRetainingCapacity();
             }
         };
 
@@ -1821,7 +1816,7 @@ fn QueryState(FlagInt: type, comptime Q: type, comptime F: Filter) type {
         const Self = @This();
         const FlagSet = HeapFlagSet(FlagInt);
         // ---------------
-        created_on: u64 = 0,
+        created_on: ?u64 = null,
         access_sets: [F.BranchCount()]AccessSet(FlagInt) = undefined,
         matched_archtypes: std.ArrayList(ArchEntry) = .empty,
         last_update: u32 = 0,
@@ -2657,15 +2652,15 @@ pub fn ArchType(FlagInt: type) type {
         }
 
         pub fn put(self: *Self, gpa: std.mem.Allocator, flags: *HeapFlagSet(FlagInt), tick: u32, entity: Entity, bundle: anytype) !void {
-            if (self.len >= self.capacity) {
-                try self.setCapacity(gpa, flags, self.capacity + self.chunk_size);
-            }
-
             var row_is_new = false;
             var wrote_owned_children_for_rollback = false;
             const index: usize = blk: {
                 const res = try self.entity_lookup.getOrPut(gpa, entity);
                 if (res.found_existing) break :blk res.value_ptr.*;
+                errdefer _ = self.entity_lookup.remove(entity);
+                if (self.len >= self.capacity) {
+                    try self.setCapacity(gpa, flags, @max(self.chunk_size, self.capacity * 2));
+                }
                 res.value_ptr.* = self.len;
                 const offset = @sizeOf(Entity) * self.len;
                 @memcpy(self.bytes[offset .. offset + @sizeOf(Entity)], std.mem.asBytes(&entity));
@@ -2711,12 +2706,12 @@ pub fn ArchType(FlagInt: type) type {
         }
 
         pub inline fn putSingle(self: *Self, gpa: std.mem.Allocator, flags: *HeapFlagSet(FlagInt), tick: u32, entity: Entity, comp: anytype) EcsError!void {
-            if (self.len >= self.capacity) {
-                try self.setCapacity(gpa, flags, self.capacity + self.chunk_size);
-            }
-
-            // const already_present = self.entity_lookup.contains(entity);
-            const index = try self.putEntity(gpa, entity);
+            const index = self.entity_lookup.get(entity) orelse blk: {
+                if (self.len >= self.capacity) {
+                    try self.setCapacity(gpa, flags, @max(self.chunk_size, self.capacity * 2));
+                }
+                break :blk try self.putEntity(gpa, entity);
+            };
             assert(self.capacity >= index);
 
             const flag = flags.getFlag(@TypeOf(comp));
@@ -2775,6 +2770,10 @@ pub fn ArchType(FlagInt: type) type {
         pub inline fn upateChanged(self: *Self, flags: *HeapFlagSet(FlagInt), tick: u32, index: usize, comptime C: type) void {
             const flag = flags.getFlag(C);
             const meta = self.getMeta(flag).?;
+            self.markChanged(tick, index, meta);
+        }
+
+        inline fn markChanged(self: *Self, tick: u32, index: usize, meta: *const ColMeta) void {
             const aligned_tick_base = Self.columnTickBase(meta, self.capacity);
             const tick_offset = aligned_tick_base + @sizeOf(TickInfo) * index;
             @memcpy(self.bytes[tick_offset + 4 .. tick_offset + 8], std.mem.asBytes(&tick));
@@ -2817,7 +2816,7 @@ pub fn ArchType(FlagInt: type) type {
             assert(intersection.eql(self.mask) or intersection.eql(dst.mask));
             const src_index = self.entity_lookup.get(entity) orelse return EcsError.EntityNotFound;
             if (dst.len >= dst.capacity) {
-                try dst.setCapacity(gpa, flags, dst.capacity + dst.chunk_size);
+                try dst.setCapacity(gpa, flags, @max(dst.chunk_size, dst.capacity * 2));
             }
             const dst_index = try dst.putEntity(gpa, entity);
             errdefer _ = dst.entity_lookup.remove(entity);
@@ -3228,7 +3227,7 @@ fn ComponentRegistry(FlagInt: type) type {
             } else {
                 const arch = &self.archtypes.items[new_arch_id.value_ptr.*];
                 if (arch.len >= arch.capacity) {
-                    try arch.setCapacity(allocator, &self.component_flags, arch.capacity + arch.chunk_size);
+                    try arch.setCapacity(allocator, &self.component_flags, @max(arch.chunk_size, arch.capacity * 2));
                 }
                 _ = try arch.putEntity(allocator, entity);
             }
@@ -3257,9 +3256,11 @@ fn ComponentRegistry(FlagInt: type) type {
             }
 
             const same_arch = mask.eql(old_mask);
+            if (!is_new_entity and same_arch) {
+                return self.archtypes.items[current_arch_id.?].put(allocator, &self.component_flags, tick, entity, bundle);
+            }
 
             const next_arch_id = try self.archtypes_lookup.getOrPut(allocator, mask);
-            assert(!same_arch or is_new_entity or next_arch_id.found_existing);
             if (!next_arch_id.found_existing) {
                 if (is_new_entity) {
                     try self.archtypes.append(allocator, .{ .chunk_size = CHUNK_SIZE });
@@ -3281,7 +3282,7 @@ fn ComponentRegistry(FlagInt: type) type {
                 try self.archtypes.items[next_arch_id.value_ptr.*].setCapacity(allocator, &self.component_flags, CHUNK_SIZE);
             }
 
-            if (!is_new_entity and !same_arch) {
+            if (!is_new_entity) {
                 try self.archtypes.items[current_arch_id.?].moveTo(
                     allocator,
                     &self.component_flags,
@@ -3546,6 +3547,20 @@ pub fn QueryIter(comptime FlagInt: type, comptime Q: type, comptime filter: *con
             assert(self.current_arch != null);
             const index = self.offset - 1; // current iteration
             const arch = if (ArchOnly) self.current_arch.? else self.current_arch.?.arch;
+            comptime var meta_idx: usize = 0;
+            inline for (@typeInfo(Q).@"struct".fields) |field| {
+                if (field.type == Entity or field.type == Arch.Meta or @sizeOf(field.type) == 0) continue;
+                const component = switch (@typeInfo(field.type)) {
+                    .pointer => |ptr| ptr.child,
+                    .optional => |opt| @typeInfo(opt.child).pointer.child,
+                    else => void,
+                };
+                if (component == C) {
+                    arch.markChanged(self.world_tick, index, self.cached_metas[meta_idx].?);
+                    return;
+                }
+                meta_idx += 1;
+            }
             arch.upateChanged(self.flags, self.world_tick, index, C);
         }
     };
@@ -3667,7 +3682,7 @@ pub fn IQueryStructFilteredNew(comptime desc: AppDesc, comptime QueryStruct: typ
             const QS = QueryState(desc.FlagInt, QueryStruct, filter);
             const state: *QS = try locals.getOrDefault(world.memtator.world(), QS);
 
-            if (state.created_on == 0) {
+            if (state.created_on == null) {
                 state.* = try QS.new(
                     world.memtator.world(),
                     &world.components.component_flags,
