@@ -3757,6 +3757,16 @@ pub fn HookRegistry(desc: AppDesc) type {
             self.despawn_hooks.deinit(gpa);
         }
 
+        pub fn clear(self: *Self, gpa: std.mem.Allocator) void {
+            self.releaseAllHookRegistryMemory(gpa);
+            self.has_add_hook = .{};
+            self.has_remove_hook = .{};
+            self.has_despawn_hook = .{};
+            self.add_hooks = .empty;
+            self.remove_hooks = .empty;
+            self.despawn_hooks = .empty;
+        }
+
         pub fn runAddedHook(self: *Self, flag: FlagSet.Flag, comp: *anyopaque, entity: Entity, world: *World) !void {
             const hooks = self.add_hooks.get(flag) orelse return;
             for (hooks.items) |hook| try hook.run(comp, entity, world);
