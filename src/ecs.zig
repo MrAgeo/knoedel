@@ -715,7 +715,23 @@ pub fn App(comptime desc: AppDesc) type {
             pub const ConditionFn = *const fn (*World, *LocalRegistry(desc.FlagInt)) EcsError!bool;
             pub const SystemFn = *const fn (*anyopaque, *World, *LocalRegistry(desc.FlagInt), u32) EcsError!void;
             pub const SystemID = u32;
-            const ScheduleID = u32;
+            const TypeID = u32;
+            const ScheduleID = struct {
+                type_id: TypeID,
+                value: u32,
+
+                pub fn from(schedule: anytype) ScheduleID {
+                    const T = @TypeOf(schedule);
+                    if (@typeInfo(T) != .@"enum") {
+                        @compileError("Schedule must be an enum");
+                    }
+
+                    return .{
+                        .type_id = hashType(T),
+                        .value = @intFromEnum(schedule),
+                    };
+                }
+            };
 
             /// a system's mem represntation
             pub const OpaqueSystem = struct {
@@ -780,7 +796,7 @@ pub fn App(comptime desc: AppDesc) type {
                 comptime {
                     if (@typeInfo(@TypeOf(schedule)) != .@"enum") @compileError("schedule needs to be of type enum");
                 }
-                const set = self.schedule_order.getPtr(@intFromEnum(schedule)) orelse return 0;
+                const set = self.schedule_order.getPtr(ScheduleID.from(schedule)) orelse return 0;
                 return set.run_time_ns;
             }
 
@@ -818,7 +834,7 @@ pub fn App(comptime desc: AppDesc) type {
             };
 
             pub fn scheduleInfo(self: *const Self, gpa: std.mem.Allocator, schedule: anytype) !ScheduleStats {
-                const set: *Schedule = self.schedule_order.getPtr(@intFromEnum(schedule)) orelse return error.NotFound;
+                const set: *Schedule = self.schedule_order.getPtr(ScheduleID.from(schedule)) orelse return error.NotFound;
                 var info = ScheduleStats{};
 
                 for (set.systems.items) |*en| {
@@ -972,7 +988,7 @@ pub fn App(comptime desc: AppDesc) type {
                 comptime system: anytype,
                 comptime condition_fn: ?ConditionFn,
             ) EcsError!void {
-                const set = try self.schedule_order.getOrPut(gpa, @intFromEnum(schedule));
+                const set = try self.schedule_order.getOrPut(gpa, ScheduleID.from(schedule));
                 if (!set.found_existing) set.value_ptr.* = .{};
 
                 const SystemType = @TypeOf(system);
@@ -1036,7 +1052,7 @@ pub fn App(comptime desc: AppDesc) type {
             pub fn run(self: *Self, schedule: anytype, world: *World) !void {
                 if (@typeInfo(@TypeOf(schedule)) != .@"enum") @compileError("schedule needs to be of type enum");
 
-                const set = self.schedule_order.getPtr(@intFromEnum(schedule)) orelse return;
+                const set = self.schedule_order.getPtr(ScheduleID.from(schedule)) orelse return;
 
                 const gpa = world.memtator.frame();
                 var scheduled_systems = try std.ArrayList(SystemID).initCapacity(gpa, 32);
@@ -1108,7 +1124,7 @@ pub fn App(comptime desc: AppDesc) type {
             }
 
             pub fn runPar(self: *Self, schedule: anytype, world: *World) !void {
-                const set = self.schedule_order.getPtr(@intFromEnum(schedule)) orelse return;
+                const set = self.schedule_order.getPtr(ScheduleID.from(schedule)) orelse return;
                 const start = std.Io.Clock.Timestamp.now(world.io, .awake);
                 const gpa = world.memtator.frame();
                 // Optimized queue entry with dependency tracking
