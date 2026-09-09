@@ -7,7 +7,7 @@ Heavily inspired by the rust ECS `Bevy`.
 
 (Very similar API)
 
-**zig version: 0.16.0**
+**Zig version:** 0.17.0-dev.2085+5e36170b5 (Sept 08 2026)
 
 ## Features
 
@@ -20,6 +20,27 @@ Heavily inspired by the rust ECS `Bevy`.
 - Children Parent relations
 - Manual control
 - Can run inside a dylib (re-add plugins after reload). Enables hot reloading!
+
+## Installing & building
+
+Use your preferred way (clone/copy/fetch)
+
+```
+zig fetch --save git+https://github.com/MrAgeo/knoedel
+```
+
+Or if you want to use the lastest stable version of zig
+
+```
+zig fetch --save git+https://github.com/MrAgeo/knoedel#integration/zig-stable
+```
+Then, in your `build.zig` file put
+
+```zig
+const knoedel_dep = b.dependency("knoedel", .{});
+//..
+your_game.root_module.addImport("knoedel", knoedel_dep.module("knoedel"));
+```
 
 ## The S in ECS. How does it work?
 
@@ -363,16 +384,3 @@ pub const Sprite = struct{
 };
 ```
 
-## Build step
-
-Use your preferred way (clone/copy/fetch)
-
-```
-zig fetch --save git+https://github.com/Lommix/knoedel
-```
-
-```zig
-const knoedel_dep = b.dependency("knoedel", .{});
-//..
-your_game.root_module.addImport("knoedel", knoedel_dep.module("knoedel"));
-```
