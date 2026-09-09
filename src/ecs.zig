@@ -2358,11 +2358,7 @@ pub fn HeapFlagSet(comptime FlagInt: type) type {
             const len = @atomicLoad(usize, &self.registered_len, .acquire);
             for (self.registered_hash[0..len], 0..) |h, i| {
                 if (h == hash) {
-                    // Refresh the fn pointers: after a hot reload the world
-                    // persists but the old dylib text is stale. Benign race —
-                    // both old and new pointers stay valid.
-                    self.registered_buf[i].print = comptime makePrintFn(T);
-                    self.registered_buf[i].json = comptime makeJsonPtr(T);
+                    self.refreshAfterReload(i, T);
                     return @enumFromInt(i);
                 }
             }
@@ -2373,8 +2369,7 @@ pub fn HeapFlagSet(comptime FlagInt: type) type {
             const locked_len = @atomicLoad(usize, &self.registered_len, .acquire);
             for (self.registered_hash[0..locked_len], 0..) |h, i| {
                 if (h == hash) {
-                    self.registered_buf[i].print = comptime makePrintFn(T);
-                    self.registered_buf[i].json = comptime makeJsonPtr(T);
+                    self.refreshAfterReload(i, T);
                     return @enumFromInt(i);
                 }
             }
@@ -2394,6 +2389,23 @@ pub fn HeapFlagSet(comptime FlagInt: type) type {
 
             @atomicStore(usize, &self.registered_len, index + 1, .release);
             return @enumFromInt(index);
+        }
+
+        /// Called on every name-hash match. After a hot reload the world
+        /// persists but the old dylib text is stale: refresh the fn pointers.
+        /// A layout change cannot be repaired in place, existing archetype
+        /// columns keep the old size, so fail fast instead of corrupting.
+        fn refreshAfterReload(self: *Self, index: usize, comptime T: type) void {
+            const info = &self.registered_buf[index];
+            if (info.size != @sizeOf(T) or info.alignment != @alignOf(T)) {
+                std.debug.panic(
+                    "component `{s}` layout changed across hot reload ({d}/{d} -> {d}/{d} size/align). Restart the game.",
+                    .{ info.name, info.size, info.alignment, @sizeOf(T), @alignOf(T) },
+                );
+            }
+            // Benign race — both old and new pointers stay valid.
+            info.print = comptime makePrintFn(T);
+            info.json = comptime makeJsonPtr(T);
         }
 
         fn makePrintFn(comptime T: type) ?*const fn (*const anyopaque, *std.Io.Writer) EcsError!void {
