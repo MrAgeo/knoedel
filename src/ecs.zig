@@ -180,6 +180,19 @@ pub fn App(comptime desc: AppDesc) type {
 
         pub fn deinit(self: *World) void {
             const gpa = self.memtator.world();
+
+            // Run OnDespawn hooks on every entity ignoring children
+            // because they are in entity_lookup.
+            var it = self.components.entity_lookup.iterator();
+            while (it.next()) |entry| {
+                self.runDespawnHooks(entry.key_ptr.*) catch |err| {
+                    std.log.err(
+                        "OnDespawn hook failed during World.deinit for entity {any}: {any}",
+                        .{ entry.key_ptr.*, err },
+                    );
+                };
+            }
+
             self.entities.unused.deinit(gpa);
             self.commands.queue.deinit(gpa);
             self.components.releaseAllComponentRegistryMemory(gpa);
@@ -584,7 +597,7 @@ pub fn App(comptime desc: AppDesc) type {
             self.commands.runAllUnsafe(self);
         }
 
-        fn despawn_with_children(self: *World, ent: Entity) EcsError!void {
+        fn runDespawnHooks(self: *World, ent: Entity) EcsError!void {
             const arch_id = self.components.entity_lookup.get(ent) orelse return;
 
             // ----------------------------------------
@@ -597,6 +610,12 @@ pub fn App(comptime desc: AppDesc) type {
                 try self.hooks.runDespawnHook(flag, ptr, ent, self);
             }
             // ----------------------------------------
+
+        }
+
+        fn despawn_with_children(self: *World, ent: Entity) EcsError!void {
+
+            try self.runDespawnHooks(ent);
 
             if (self.components.getSingle(ent, Children)) |children| {
                 for (children.items.items) |child| {
@@ -625,6 +644,8 @@ pub fn App(comptime desc: AppDesc) type {
             if (include_children) {
                 try self.despawn_with_children(ent);
             } else {
+                try self.runDespawnHooks(ent);
+
                 if (self.components.getSingle(ent, Children)) |children| {
                     for (children.items.items) |child_entity| {
                         try self.components.remove(self.memtator.world(), child_entity, Parent);

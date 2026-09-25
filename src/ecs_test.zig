@@ -331,6 +331,99 @@ test "despawn tolerates stale child ids" {
     try expect(world.entityCount() == 0);
 }
 
+test "world.deinit(), despawn and despawnUnlink run OnDespawn hooks" {
+    const app = App(.{});
+    var world = try app.init(std.testing.allocator, testIo());
+    const cmd = world.getCommands();
+    // world.deinit is last because of the test 
+
+    const Counters = struct {
+        pub var appends: usize = 0;
+        pub var despawnHook_calls: usize = 0;
+    };
+
+    const Foo = struct {};
+    const TestComponent = struct {
+        data: std.ArrayList(u8) = .empty,
+    };
+
+    const on_despawn = struct {
+        fn run(
+            comp: *TestComponent,
+            _: Entity,
+            w: *app,
+        ) EcsError!void {
+            Counters.despawnHook_calls += 1;
+            comp.data.deinit(w.memtator.world());
+        }
+    }.run;
+
+    const query = app.Query(struct {comp: *TestComponent});
+    const sys = struct {
+        fn run(alloc: app.Alloc, q: query) !void {
+            var it = q.iter();
+            while (it.next()) |entry| {
+                Counters.appends += 1;
+                try entry.comp.data.append(alloc.gpa, 32);
+            }
+        }
+    }.run;
+
+    const Schedule = enum { update };
+    try world.addSystem(Schedule.update, &sys);
+    try world.addOnDespawnHook(TestComponent, &on_despawn);
+
+    // Entity to despawn via cmd.despawnUnlink
+    //
+    // 2 entities here: parent + child
+    const ent_unlink = try cmd.spawn(.{
+        TestComponent{},
+        .{
+            Foo{},
+            TestComponent{}
+        }
+    });
+
+    // Entity to despawn via cmd.despawn
+    //
+    // 2 entities here: parent + child
+    const parent = try cmd.spawn(.{
+        TestComponent{},
+        .{ TestComponent{} },
+    });
+
+    world.update();
+
+    const expected_ents = 4;
+    const expected_appends = 4;
+
+    const expected_despawns_parent = 2;
+    const expected_despawns_unlink = expected_despawns_parent + 1;
+
+    // Includes dangling child despawn
+    const expected_despawns_final = expected_despawns_unlink + 1;
+
+    try expect(world.entityCount() == expected_ents);
+    world.run(Schedule.update);
+    world.update();
+    try expect(Counters.appends == expected_appends);
+
+    try cmd.despawn(parent);
+    world.update();
+    try expect(Counters.despawnHook_calls == expected_despawns_parent);
+
+    try cmd.despawnUnlink(ent_unlink);
+    world.update();
+    try expect(Counters.despawnHook_calls == expected_despawns_unlink);
+
+    // World.deinit must run onDespawn hooks to prevent memory leak
+    world.deinit();
+
+    // Final checks
+    try expect(Counters.appends == expected_appends);
+    try expect(Counters.despawnHook_calls == expected_despawns_final);
+}
+
 test "temporary queries allocate match state from frame arena" {
     const Foo = struct { n: i32 };
 
