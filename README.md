@@ -7,7 +7,7 @@ Heavily inspired by the rust ECS `Bevy`.
 
 (Very similar API)
 
-**zig version: 0.17.0**
+**zig version: 0.17.0-dev.2320+1e770dbef** (Sept 27 2026)
 
 ## Features
 
