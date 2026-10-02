@@ -1,7 +1,7 @@
 .{
     .name = .knoedel,
     .version = "0.0.1",
-    .minimum_zig_version = "0.17.0-dev.2307+392b17125", // Sept 25 2026
+    .minimum_zig_version = "0.17.0-dev.2384+ac77c23af", // Sept 30 2026
     .dependencies = .{},
     .paths = .{
         "build.zig",
