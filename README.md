@@ -26,6 +26,60 @@ Heavily inspired by the rust ECS `Bevy`.
 Every System is a function, composed of arguments that implement a `fromWorld` function and mark what they need as mutable and immutable via an `addAccess` function.
 The scheduler will then sort all your systems by access and run in parallel what does not collide (per schedule).
 
+## Build
+
+Choose your preferred method to add `knoedel` as a dependency (clone, copy or fetch). For the latest stable Zig version, run
+
+```
+zig fetch --save git+https://github.com/MrAgeo/knoedel#integration/zig-stable
+```
+
+Or, if you want the latest Zig development version (0.18.0-dev, updated monthly):
+```
+zig fetch --save git+https://github.com/MrAgeo/knoedel
+```
+
+
+Alternatively, you can clone (or manually download) the repository into your desired directory via
+
+```
+git clone -b integration/zig-stable https://github.com/MrAgeo/knoedel
+```
+
+or
+
+```
+git clone https://github.com/MrAgeo/knoedel
+```
+
+If you cloned or copied the repository, remember to add it as a dependency in your `build.zig.zon` file:
+
+```zig
+.dependencies = .{
+    .knoedel = .{
+        .path = "path/to/knoedel",
+    },
+},
+```
+
+Replace `path/to/knoedel` with the path to your local directory containing the repository.
+
+### Import the dependency
+
+Just add in your `build.zig` file:
+
+```zig
+const knoedel_dep = b.dependency("knoedel", .{});
+//..
+your_game.root_module.addImport("knoedel", knoedel_dep.module("knoedel"));
+```
+
+You can now import `knoedel` in your Zig source files via
+
+```zig
+const kn = @import("knoedel");
+```
+
 ## How to run
 
 ```zig
@@ -363,18 +417,4 @@ pub const Sprite = struct{
 
     //...
 };
-```
-
-## Build step
-
-Use your preferred way (clone/copy/fetch)
-
-```
-zig fetch --save git+https://github.com/Lommix/knoedel
-```
-
-```zig
-const knoedel_dep = b.dependency("knoedel", .{});
-//..
-your_game.root_module.addImport("knoedel", knoedel_dep.module("knoedel"));
 ```
